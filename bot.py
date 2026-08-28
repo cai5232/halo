@@ -1,4 +1,4 @@
-import json, os
+import asyncio, json, os, tempfile
 from pathlib import Path
 import httpx
 from telegram import Update
@@ -49,6 +49,24 @@ async def claude_chat(messages: list) -> str:
         return data['content'][0]['text']
 
 
+async def claude_with_image(img_path: str, caption: str) -> str:
+    prompt = f'请看这张图片：{img_path}\n\n用户说：{caption}'
+    proc = await asyncio.create_subprocess_exec(
+        'claude', '-p', prompt,
+        '--add-dir', '/tmp',
+        '--dangerously-skip-permissions',
+        '--output-format', 'text',
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=120)
+    return stdout.decode().strip()
+
+
+def send_paragraphs(reply: str):
+    return [p.strip() for p in reply.split('\n\n') if p.strip()] or [reply]
+
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
     if ALLOWED_CHAT_ID and chat_id != ALLOWED_CHAT_ID:
@@ -78,11 +96,43 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         history[chat_id] = messages[-MAX_HISTORY:]
         save_history(history)
 
-        paragraphs = [p.strip() for p in reply.split('\n\n') if p.strip()]
-        for para in (paragraphs or [reply]):
+        for para in send_paragraphs(reply):
             await update.message.reply_text(para)
     except Exception as e:
         await update.message.reply_text(f'出错了：{e}')
+
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = str(update.effective_chat.id)
+    if ALLOWED_CHAT_ID and chat_id != ALLOWED_CHAT_ID:
+        return
+
+    await context.bot.send_chat_action(chat_id=chat_id, action='typing')
+
+    photo = update.message.photo[-1]
+    tg_file = await context.bot.get_file(photo.file_id)
+
+    with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False, dir='/tmp') as f:
+        tmp_path = f.name
+
+    try:
+        await tg_file.download_to_drive(tmp_path)
+        caption = update.message.caption or '请描述这张图片'
+        reply = await claude_with_image(tmp_path, caption)
+    except Exception as e:
+        reply = f'图片处理出错：{e}'
+    finally:
+        os.unlink(tmp_path)
+
+    history = load_history()
+    messages = history.get(chat_id, [])
+    messages.append({'role': 'user', 'content': f'[图片] {update.message.caption or ""}'})
+    messages.append({'role': 'assistant', 'content': reply})
+    history[chat_id] = messages[-MAX_HISTORY:]
+    save_history(history)
+
+    for para in send_paragraphs(reply):
+        await update.message.reply_text(para)
 
 
 async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -101,6 +151,7 @@ def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler('start', cmd_start))
     app.add_handler(CommandHandler('reset', cmd_reset))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.run_polling()
 
