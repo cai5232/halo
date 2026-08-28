@@ -1,132 +1,107 @@
-import asyncio
-import json
-import os
+import json, os
 from pathlib import Path
-
+import httpx
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-
 from ombre_client import OmbreClient
 
 BOT_TOKEN = os.environ['TG_BOT_TOKEN']
 ALLOWED_CHAT_ID = os.environ.get('ALLOWED_CHAT_ID', '')
-SESSIONS_FILE = Path('/data/sessions.json')
-OMBRE = OmbreClient()
+PROXY_URL = os.environ.get('CLAUDE_PROXY_URL', 'http://localhost:8792')
+PROXY_TOKEN = os.environ.get('PROXY_AUTH_TOKEN', '')
+OMBRE_ENABLED = os.environ.get('OMBRE_ENABLED', 'true').lower() == 'true'
+HISTORY_FILE = Path('/data/history.json')
+OMBRE = OmbreClient() if OMBRE_ENABLED else None
+
+MAX_HISTORY = 100
 
 
-def load_sessions() -> dict:
-    try:
-        if SESSIONS_FILE.exists():
-            return json.loads(SESSIONS_FILE.read_text())
-    except Exception:
-        pass
+def load_history() -> dict:
+    if HISTORY_FILE.exists():
+        try:
+            return json.loads(HISTORY_FILE.read_text())
+        except Exception:
+            return {}
     return {}
 
 
-def save_sessions(sessions: dict) -> None:
-    SESSIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    SESSIONS_FILE.write_text(json.dumps(sessions, ensure_ascii=False))
+def save_history(data: dict):
+    HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    HISTORY_FILE.write_text(json.dumps(data, ensure_ascii=False))
 
 
-async def claude_run(prompt: str, session_id: str | None) -> tuple[str, str | None]:
-    cmd = ['claude', '-p', '--output-format', 'stream-json']
-    if session_id:
-        cmd += ['--resume', session_id]
-    cmd.append(prompt)
+async def claude_chat(messages: list) -> str:
+    headers = {'Content-Type': 'application/json'}
+    if PROXY_TOKEN:
+        headers['Authorization'] = f'Bearer {PROXY_TOKEN}'
 
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        cwd='/app'
-    )
-    try:
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=180)
-    except asyncio.TimeoutError:
-        proc.kill()
-        return '(响应超时，请重试)', session_id
+    body = {
+        'model': 'claude-opus-4-5',
+        'max_tokens': 8096,
+        'messages': messages,
+        'stream': False,
+    }
 
-    new_sid = session_id
-    result = ''
-    for line in stdout.decode(errors='replace').splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            data = json.loads(line)
-            if data.get('type') == 'result':
-                result = data.get('result', '')
-                sid = data.get('session_id')
-                if sid:
-                    new_sid = sid
-        except json.JSONDecodeError:
-            pass
-
-    return (result or stdout.decode(errors='replace').strip() or '(无回复)'), new_sid
+    async with httpx.AsyncClient(timeout=180) as client:
+        resp = await client.post(f'{PROXY_URL}/v1/messages', json=body, headers=headers)
+        resp.raise_for_status()
+        data = resp.json()
+        return data['content'][0]['text']
 
 
-def get_memory(query: str) -> str:
-    data = OMBRE.breath(query, limit=5)
-    memories = data.get('memories', [])
-    if not memories:
-        return ''
-    return '\n'.join(m.get('content', '') for m in memories if m.get('content'))
-
-
-def split_msg(text: str, limit: int = 4000) -> list[str]:
-    if len(text) <= limit:
-        return [text]
-    parts = []
-    while text:
-        parts.append(text[:limit])
-        text = text[limit:]
-    return parts
-
-
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
     if ALLOWED_CHAT_ID and chat_id != ALLOWED_CHAT_ID:
         return
 
-    text = (update.message.text or '').strip()
-    if not text:
-        return
-
+    user_text = update.message.text
     await context.bot.send_chat_action(chat_id=chat_id, action='typing')
 
-    sessions = load_sessions()
-    session_id = sessions.get(chat_id)
+    history = load_history()
+    messages = history.get(chat_id, [])
 
-    memory = get_memory(text)
-    prompt = text
-    if memory:
-        prompt = f'[相关记忆]\n{memory}\n\n{text}'
+    content = user_text
+    if OMBRE:
+        try:
+            memories = await OMBRE.breath(user_text, limit=5)
+            if memories:
+                mem_text = '\n'.join(f'- {m}' for m in memories)
+                content = f'[相关记忆]\n{mem_text}\n\n{user_text}'
+        except Exception:
+            pass
 
-    reply, new_sid = await claude_run(prompt, session_id)
+    messages.append({'role': 'user', 'content': content})
 
-    if new_sid and new_sid != session_id:
-        sessions[chat_id] = new_sid
-        save_sessions(sessions)
+    try:
+        reply = await claude_chat(messages)
+        messages.append({'role': 'assistant', 'content': reply})
+        history[chat_id] = messages[-MAX_HISTORY:]
+        save_history(history)
 
-    for part in split_msg(reply):
-        await update.message.reply_text(part)
+        for i in range(0, len(reply), 4000):
+            await update.message.reply_text(reply[i:i + 4000])
+    except Exception as e:
+        await update.message.reply_text(f'出错了：{e}')
 
 
-async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
-    if ALLOWED_CHAT_ID and chat_id != ALLOWED_CHAT_ID:
-        return
-    sessions = load_sessions()
-    sessions.pop(chat_id, None)
-    save_sessions(sessions)
-    await update.message.reply_text('对话已重置 (´・ω・`)')
+    history = load_history()
+    history.pop(chat_id, None)
+    save_history(history)
+    await update.message.reply_text("对话已重置 (´·ω·`)")
 
 
-def main() -> None:
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("嗨 (´·ω·`)")
+
+
+def main():
     app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler('start', cmd_start))
     app.add_handler(CommandHandler('reset', cmd_reset))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    app.run_polling(drop_pending_updates=True)
+    app.run_polling()
 
 
 if __name__ == '__main__':
