@@ -78,8 +78,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         history[chat_id] = messages[-MAX_HISTORY:]
         save_history(history)
 
-        for i in range(0, len(reply), 4000):
-            await update.message.reply_text(reply[i:i + 4000])
+        paragraphs = [p.strip() for p in reply.split('\n\n') if p.strip()]
+        for para in (paragraphs or [reply]):
+            await update.message.reply_text(para)
     except Exception as e:
         await update.message.reply_text(f'出错了：{e}')
 
